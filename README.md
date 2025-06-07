@@ -51,7 +51,7 @@ Systeemvereisten
 
 In deze repository zijn drie files terug te vinden. 
 - Een file met de arduino code voor de werking van de armband.
-- Een file met php code voor het ophalen van de puffs (vandaag) en het ingestelde doel uit de Breezd database.
-- Een file met php code voor de geregistreerde puffs die met de armband zijn waargenomen door te sturen naar de database.
+- Een file met php code voor het ophalen van de puffs (vandaag) en het ingestelde doel uit de Breezd database. (get_daily_goal.php)
+- Een file met php code voor de geregistreerde puffs die met de armband zijn waargenomen door te sturen naar de database. (log_puff.php)
 
   
