@@ -1,0 +1,231 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <MPU6050.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
+
+// OLED-configuratie
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// MPU6050
+MPU6050 mpu;
+
+// Geluidsensor KY-038
+const int soundSensorDigitalPin = 32;
+bool lastSoundState = LOW;
+unsigned long lastSoundTrigger = 0;
+const unsigned long soundDebounceDelay = 200;
+bool soundDetected = false;
+bool soundDetectionAllowed = false;
+
+// WiFi
+const char* ssid = "telenet-B3697";
+const char* password = "BhJ4eyTKExGQ";
+
+// Server
+const char* serverLogURL = "https://automatehq.be/breezd/log_puff.php";
+const char* serverGetURL = "https://automatehq.be/breezd/get_daily_goal.php";
+
+// Gebruiker
+const int userId = 74;
+
+// Puff-data
+int displayedMovements = 0;
+int goalUsage = 0;
+
+// Beweging
+bool upwardMovementDetected = false;
+bool downwardMovementDetected = false;
+
+unsigned long lastUpdate = 0;
+const int updateInterval = 100;
+const int movementDurationThreshold = 300;
+const int movementIntensityThreshold = 10000;
+const int longMovementThreshold = 1500;
+const int stepFrequencyThreshold = 200;
+const int minUpwardDeltaY = 10000;
+const int minDownwardDeltaY = -10000;
+unsigned long movementStartTime = 0;
+unsigned long lastMovementTime = 0;
+int16_t lastAx, lastAy, lastAz;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("OLED niet gevonden.");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextSize(3);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 20);
+  display.print("BREEZD");
+  display.display();
+  delay(2000);
+
+  // MPU6050
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 niet verbonden.");
+    while (1);
+  }
+  mpu.getAcceleration(&lastAx, &lastAy, &lastAz);
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Verbinden met WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nVerbonden!");
+
+  // Tijd
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+  tzset();
+
+  Serial.print("Wachten op tijdsync");
+  while (time(nullptr) < 100000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nTijd gesynchroniseerd!");
+
+  fetchTodayProgress();
+  updateDisplay();
+
+  pinMode(soundSensorDigitalPin, INPUT);
+}
+
+void loop() {
+  if (millis() - lastUpdate < updateInterval) return;
+  lastUpdate = millis();
+
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  int deltaY = ay - lastAy;
+  int delta = abs(ax - lastAx) + abs(deltaY) + abs(az - lastAz);
+
+  if (delta > movementIntensityThreshold) {
+    if (!upwardMovementDetected && deltaY > minUpwardDeltaY) {
+      upwardMovementDetected = true;
+      soundDetectionAllowed = true;
+      Serial.println("Opwaartse beweging gedetecteerd!");
+    }
+    if (upwardMovementDetected && soundDetected && !downwardMovementDetected && deltaY < minDownwardDeltaY) {
+      downwardMovementDetected = true;
+      Serial.println("Neerwaartse beweging gedetecteerd!");
+    }
+  }
+
+  bool currentSoundState = digitalRead(soundSensorDigitalPin);
+  unsigned long now = millis();
+  if (soundDetectionAllowed && currentSoundState == HIGH && lastSoundState == LOW && (now - lastSoundTrigger > soundDebounceDelay)) {
+    soundDetected = true;
+    soundDetectionAllowed = false;
+    lastSoundTrigger = now;
+    Serial.println("Geluid gedetecteerd!");
+  }
+  lastSoundState = currentSoundState;
+
+  if (upwardMovementDetected && soundDetected && downwardMovementDetected) {
+    displayedMovements++;
+    logPuffToServer(1);
+    updateDisplay();
+    upwardMovementDetected = false;
+    soundDetected = false;
+    downwardMovementDetected = false;
+    soundDetectionAllowed = false;
+    lastMovementTime = millis();
+  }
+
+  lastAx = ax;
+  lastAy = ay;
+  lastAz = az;
+
+  static unsigned long lastTimeUpdate = 0;
+  if (millis() - lastTimeUpdate > 60000) {
+    updateDisplay();
+    lastTimeUpdate = millis();
+  }
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("BREEZD");
+
+  display.setTextSize(1);
+  display.setCursor(0, 25);
+  display.print("Puffs vandaag:");
+
+  display.setTextSize(2);
+  display.setCursor(0, 45);
+  display.print(displayedMovements);
+  display.print("/");
+  display.print(goalUsage);
+
+  display.setTextSize(1);
+  display.setCursor(95, 0);
+  display.print(getFormattedTime());
+  display.display();
+}
+
+void fetchTodayProgress() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = String(serverGetURL) + "?user_id=" + String(userId);
+    http.begin(url);
+    int httpResponseCode = http.GET();
+    if (httpResponseCode == 200) {
+      String payload = http.getString();
+      int sepIndex = payload.indexOf("/");
+      if (sepIndex > 0) {
+        displayedMovements = payload.substring(0, sepIndex).toInt();
+        goalUsage = payload.substring(sepIndex + 1).toInt();
+      }
+    } else {
+      Serial.print("Fout bij ophalen puffs: ");
+      Serial.println(httpResponseCode);
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi niet verbonden.");
+  }
+}
+
+void logPuffToServer(int amount) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverLogURL);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    String data = "user_id=" + String(userId) + "&amount=" + String(amount);
+    int httpResponseCode = http.POST(data);
+    Serial.print("HTTP code: ");
+    Serial.println(httpResponseCode);
+    http.end();
+  } else {
+    Serial.println("Geen WiFi bij puff-log.");
+  }
+}
+
+String getFormattedTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "??:??";
+  }
+  char buffer[6];
+  snprintf(buffer, sizeof(buffer), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+  return String(buffer);
+}
